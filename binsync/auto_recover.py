@@ -148,13 +148,22 @@ def auto_recover(controller) -> bool:
     return True
 
 
-class AutoRecoverHook(idaapi.IDB_Hooks):
-    """Fires auto_recover() whenever IDA loads a new input file."""
+class AutoRecoverHook(idaapi.UI_Hooks):
+    """Fires auto_recover() whenever IDA finishes initializing a database.
+
+    ``database_inited`` fires for *both* freshly-loaded input files and reopened
+    databases. The IDB ``load_file``/``loader_finished`` event only runs when the
+    external file loader runs, so it is skipped when IDA restores an existing
+    .i64/.idb — which is why a reopened database was never auto-recovered.
+    """
 
     def __init__(self, controller):
-        idaapi.IDB_Hooks.__init__(self)
+        idaapi.UI_Hooks.__init__(self)
         self.controller = controller
         self._attempted = set()
+
+    def database_inited(self, is_new_database, idc_script):
+        return self._on_file_loaded()
 
     def _on_file_loaded(self):
         if os.environ.get("BINSYNC_AUTO_RECOVER", "1") == "0":
@@ -173,11 +182,3 @@ class AutoRecoverHook(idaapi.IDB_Hooks):
             self._attempted.add(md5)
 
         return 0
-
-    # IDA >= 9.0 renamed the load-completion hook from load_file to
-    # loader_finished; define both so the hook fires on old and new SDKs.
-    def loader_finished(self, li, neflags, filetypename):
-        return self._on_file_loaded()
-
-    def load_file(self, li, neflags, format):
-        return self._on_file_loaded()
