@@ -156,7 +156,7 @@ class AutoRecoverHook(idaapi.IDB_Hooks):
         self.controller = controller
         self._attempted = set()
 
-    def load_file(self, li, neflags, format):
+    def _on_file_loaded(self):
         if os.environ.get("BINSYNC_AUTO_RECOVER", "1") == "0":
             return 0
 
@@ -173,3 +173,11 @@ class AutoRecoverHook(idaapi.IDB_Hooks):
             self._attempted.add(md5)
 
         return 0
+
+    # IDA >= 9.0 renamed the load-completion hook from load_file to
+    # loader_finished; define both so the hook fires on old and new SDKs.
+    def loader_finished(self, li, neflags, filetypename):
+        return self._on_file_loaded()
+
+    def load_file(self, li, neflags, format):
+        return self._on_file_loaded()
