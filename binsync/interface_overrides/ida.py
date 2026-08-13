@@ -111,6 +111,11 @@ class BinsyncPlugin(GenericIDAPlugin):
         super().__init__(*args, **kwargs)
         self.controller = BSController(decompiler_interface=self.interface)
 
+        # auto-connect on file load via a sidecar <binary>.binsync.json, if present
+        from binsync.auto_recover import AutoRecoverHook
+        self._auto_recover_hook = AutoRecoverHook(self.controller)
+        self._auto_recover_hook.hook()
+
     @no_concurrent_call
     def open_config_dialog(self):
         dialog = ConfigureBSDialog(self.controller)
@@ -134,6 +139,11 @@ class BinsyncPlugin(GenericIDAPlugin):
         """
         Open the control panel view and attach it to IDA View-A or Pseudocode-A.
         """
+        # Auto-recover connects with start_ui=False (creating a QThread during
+        # database_inited crashes Qt6Widgets). Ensure the UI-updater thread is
+        # running now that we're on the Qt main thread. No-op if already running.
+        self.controller._init_ui_components()
+
         # If a panel already exists, reuse it. Building a new ControlPanel on
         # every project (re)selection orphans the old one's models and queued
         # signals; once Python eventually GCs them, pending QMetaCallEvents hit
@@ -213,6 +223,10 @@ class BinsyncPlugin(GenericIDAPlugin):
         self.open_config_dialog()
 
     def term(self):
+        auto_hook = getattr(self, "_auto_recover_hook", None)
+        if auto_hook is not None:
+            auto_hook.unhook()
+            self._auto_recover_hook = None
         if self.controller:
             self.controller.stop_worker_routines()
             del self.controller

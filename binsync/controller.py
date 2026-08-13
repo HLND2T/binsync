@@ -331,7 +331,7 @@ class BSController:
                 self._got_first_state |= True
                 self._last_all_states = all_states
                 # update context knowledge every loop iteration
-                if self.ctx_change_callback:
+                if self.ctx_change_callback and self._ui_updater_worker is not None:
                     self._ui_updater_worker.schedule_job(
                         Job(self._check_and_notify_ctx, all_states)
                     )
@@ -341,9 +341,10 @@ class BSController:
                         int(now.timestamp() - self._last_reload.timestamp()) > self.reload_time:
                     self._last_reload = datetime.datetime.now(tz=datetime.timezone.utc)
 
-                    self._ui_updater_worker.schedule_job(
-                        Job(self._update_ui, all_states)
-                    )
+                    if self._ui_updater_worker is not None:
+                        self._ui_updater_worker.schedule_job(
+                            Job(self._update_ui, all_states)
+                        )
 
                     # attempt to fast-sync anything that is easy to sync
                     if self.do_safe_sync_all:
@@ -372,7 +373,7 @@ class BSController:
         self.last_active_func = curr_func
         self.ctx_change_callback(states)
 
-    def start_worker_routines(self):
+    def start_worker_routines(self, start_ui=True):
         self._run_updater_threads = True
         # Thread instances can only be started once; recreate after a previous run
         # (e.g. when switching projects re-runs connect()).
@@ -382,7 +383,11 @@ class BSController:
 
         self.push_job_scheduler.start_worker_thread()
 
-        self._init_ui_components()
+        # The Qt UI-updater thread must not be spun up before IDA's Qt event loop
+        # is running (e.g. during auto-recover's database_inited connect). Defer it
+        # to the GUI-open path when start_ui is False.
+        if start_ui:
+            self._init_ui_components()
         # start the callbacks for edits to artifacts
         self.deci.start_artifact_watchers()
 
@@ -405,7 +410,7 @@ class BSController:
     # Client Interaction Functions
     #
 
-    def connect(self, user, path, init_repo=False, remote_url=None, single_thread=False, **kwargs):
+    def connect(self, user, path, init_repo=False, remote_url=None, single_thread=False, start_ui=True, **kwargs):
         # If we were previously connected, tear down the old worker routines first
         # so we don't end up with stale background threads pointing at the old client.
         if self.client is not None:
@@ -420,7 +425,7 @@ class BSController:
         )
 
         if not single_thread:
-            self.start_worker_routines()
+            self.start_worker_routines(start_ui=start_ui)
 
         return self.client.connection_warnings
 
@@ -1131,6 +1136,72 @@ class BSController:
     def _flush_force_push_state(self):
         self.client.commit_and_update_states()
 
+    def _collect_force_push_functions(self, master_state: State, func_addrs: List[int], use_decompilation: bool = False) -> Tuple[int, List[Function]]:
+        """
+        Collect the functions currently stored in the decompiler into ``master_state``.
+        Returns ``(num_committed, funcs)``; ``funcs`` is returned so callers can also
+        collect the comments contained within each pushed function.
+        """
+        funcs = []
+        if use_decompilation:
+            for func_addr in progress_bar(func_addrs, gui=not self.headless, desc="Decompiling functions to push..."):
+                f = self.deci.functions[func_addr]
+                if not f:
+                    _l.warning(f"Failed to force push function @ %s", func_addr)
+                    continue
+
+                funcs.append(f)
+        else:
+            # no progress bar needed!
+            _func_addrs = set(func_addrs)
+            for addr, func in self.deci.functions.items():
+                if addr in _func_addrs:
+                    funcs.append(func)
+
+        for func in funcs:
+            master_state.set_function(func)
+
+        return len(funcs), funcs
+
+    def _collect_force_push_globals(self, master_state: State, addrs: List[int]) -> int:
+        committed = 0
+        for addr in addrs:
+            try:
+                art = self.deci.global_vars[addr]
+            except KeyError:
+                continue
+            master_state.set_global_var(art)
+            committed += 1
+        return committed
+
+    def _collect_force_push_types(self, master_state: State, names: List[str]) -> int:
+        committed = 0
+        for name in names:
+            if name in self.deci.structs:
+                master_state.set_struct(self.deci.structs[name])
+            elif name in self.deci.enums:
+                master_state.set_enum(self.deci.enums[name])
+            elif name in self.deci.typedefs:
+                master_state.set_typedef(self.deci.typedefs[name])
+            else:
+                continue
+            committed += 1
+        return committed
+
+    def _collect_force_push_segments(self, master_state: State, segment_names: List[str]) -> int:
+        committed = 0
+        for segment_name in segment_names:
+            try:
+                segment = self.deci.segments[segment_name]
+                if segment:
+                    master_state.set_segment(segment)
+                    committed += 1
+                else:
+                    _l.warning("Failed to force push segment @ %s", segment_name)
+            except KeyError:
+                _l.warning("Segment at %s not found in decompiler", segment_name)
+        return committed
+
     @init_checker
     def force_push_functions(self, func_addrs: List[int], use_decompilation=False):
         """
@@ -1149,28 +1220,7 @@ class BSController:
             return
 
         master_state: State = self.client.master_state
-        committed = 0
-        progress_str = "Decompiling functions to push..." if use_decompilation else "Collecting functions..."
-
-        funcs = []
-        if use_decompilation:
-            for func_addr in progress_bar(func_addrs, gui=not self.headless, desc=progress_str):
-                f = self.deci.functions[func_addr]
-                if not f:
-                    _l.warning(f"Failed to force push function @ %s", func_addr)
-                    continue
-
-                funcs.append(f)
-        else:
-            # no progress bar needed!
-            _func_addrs = set(func_addrs)
-            for addr, func in self.deci.functions.items():
-                if addr in _func_addrs:
-                    funcs.append(func)
-
-        for func in funcs:
-            master_state.set_function(func)
-        committed += len(funcs)
+        committed, funcs = self._collect_force_push_functions(master_state, func_addrs, use_decompilation)
 
         # also force push the comments contained within each pushed function. comments are a
         # separate, address-keyed artifact rather than fields on the Function, so they are not
@@ -1238,14 +1288,7 @@ class BSController:
             return
 
         master_state: State = self.client.master_state
-        committed = 0
-        for addr in addrs:
-            try:
-                art = self.deci.global_vars[addr]
-            except KeyError:
-                continue
-            master_state.set_global_var(art)
-            committed += 1
+        committed = self._collect_force_push_globals(master_state, addrs)
 
         master_state.last_commit_msg = f"Force pushed {committed} global{'' if committed == 1 else 's'}"
         self.client.master_state = master_state
@@ -1263,17 +1306,7 @@ class BSController:
             return
 
         master_state: State = self.client.master_state
-        committed = 0
-        for name in names:
-            if name in self.deci.structs:
-                master_state.set_struct(self.deci.structs[name])
-            elif name in self.deci.enums:
-                master_state.set_enum(self.deci.enums[name])
-            elif name in self.deci.typedefs:
-                master_state.set_typedef(self.deci.typedefs[name])
-            else:
-                continue
-            committed += 1
+        committed = self._collect_force_push_types(master_state, names)
 
         master_state.last_commit_msg = f"Force pushed {committed} type{'' if committed == 1 else 's'}"
         self.client.master_state = master_state
@@ -1281,7 +1314,7 @@ class BSController:
         self.deci.info(f"Types force push successful: committed {committed} type{'' if committed == 1 else 's'}.")
 
     @init_checker
-    def force_push_segments(self, segment_names: List[int]):
+    def force_push_segments(self, segment_names: List[str]):
         """
         Collects the segments currently stored in the decompiler, not the BS State,
         and commits them to the master users BS Database.
@@ -1294,23 +1327,59 @@ class BSController:
             return
 
         master_state: State = self.client.master_state
-        committed = 0
-        
-        for segment_name in segment_names:
-            try:
-                segment = self.deci.segments[segment_name]
-                if segment:
-                    master_state.set_segment(segment)
-                    committed += 1
-                else:
-                    _l.warning("Failed to force push segment @ %s", segment_name)
-            except KeyError:
-                _l.warning("Segment at %s not found in decompiler", segment_name)
+        committed = self._collect_force_push_segments(master_state, segment_names)
 
         master_state.last_commit_msg = f"Force pushed {committed} segments"
         self.client.master_state = master_state
         self._flush_force_push_state()
         self.deci.info(f"Segments force push successful: committed {committed} segment{'' if committed == 1 else 's'}.")
+
+    @init_checker
+    def force_push_all(
+        self,
+        func_addrs: List[int],
+        global_addrs: List[int],
+        type_names: List[str],
+        segment_names: List[str],
+        use_decompilation: bool = False,
+    ):
+        """
+        Collects functions (plus their contained comments), globals, types, and segments
+        currently stored in the decompiler and commits them all to the master user's BS
+        Database in a single commit, instead of one commit per artifact type like the
+        individual ``force_push_*`` helpers.
+
+        @param func_addrs: Function addresses to push (lifted form). May be empty.
+        @param global_addrs: Global variable addresses to push. May be empty.
+        @param type_names: Type names (structs, enums, typedefs) to push. May be empty.
+        @param segment_names: Segment names to push. May be empty.
+        @param use_decompilation: Push full function headers (args + stack vars) too.
+        @return: Success of committing the artifacts.
+        """
+        master_state: State = self.client.master_state
+        committed = 0
+
+        funcs: List[Function] = []
+        if func_addrs:
+            n_funcs, funcs = self._collect_force_push_functions(master_state, func_addrs, use_decompilation)
+            committed += n_funcs
+
+        cmt_committed = self._force_push_function_comments(master_state, funcs) if funcs else 0
+
+        if global_addrs:
+            committed += self._collect_force_push_globals(master_state, global_addrs)
+        if type_names:
+            committed += self._collect_force_push_types(master_state, type_names)
+        if segment_names:
+            committed += self._collect_force_push_segments(master_state, segment_names)
+
+        cmt_suffix = f" and {cmt_committed} comment{'' if cmt_committed == 1 else 's'}" if cmt_committed else ""
+        master_state.last_commit_msg = f"Force pushed {committed} artifacts{cmt_suffix}"
+        self.client.master_state = master_state
+        self._flush_force_push_state()
+        self.deci.info(
+            f"Force push successful: committed {committed} artifact{'' if committed == 1 else 's'}{cmt_suffix}."
+        )
 
     #
     # Utils
