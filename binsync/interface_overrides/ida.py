@@ -111,6 +111,11 @@ class BinsyncPlugin(GenericIDAPlugin):
         super().__init__(*args, **kwargs)
         self.controller = BSController(decompiler_interface=self.interface)
 
+        # auto-connect on file load via a sidecar <binary>.binsync.json, if present
+        from binsync.auto_recover import AutoRecoverHook
+        self._auto_recover_hook = AutoRecoverHook(self.controller)
+        self._auto_recover_hook.hook()
+
     @no_concurrent_call
     def open_config_dialog(self):
         dialog = ConfigureBSDialog(self.controller)
@@ -213,6 +218,10 @@ class BinsyncPlugin(GenericIDAPlugin):
         self.open_config_dialog()
 
     def term(self):
+        auto_hook = getattr(self, "_auto_recover_hook", None)
+        if auto_hook is not None:
+            auto_hook.unhook()
+            self._auto_recover_hook = None
         if self.controller:
             self.controller.stop_worker_routines()
             del self.controller
