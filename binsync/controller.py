@@ -331,7 +331,7 @@ class BSController:
                 self._got_first_state |= True
                 self._last_all_states = all_states
                 # update context knowledge every loop iteration
-                if self.ctx_change_callback:
+                if self.ctx_change_callback and self._ui_updater_worker is not None:
                     self._ui_updater_worker.schedule_job(
                         Job(self._check_and_notify_ctx, all_states)
                     )
@@ -341,9 +341,10 @@ class BSController:
                         int(now.timestamp() - self._last_reload.timestamp()) > self.reload_time:
                     self._last_reload = datetime.datetime.now(tz=datetime.timezone.utc)
 
-                    self._ui_updater_worker.schedule_job(
-                        Job(self._update_ui, all_states)
-                    )
+                    if self._ui_updater_worker is not None:
+                        self._ui_updater_worker.schedule_job(
+                            Job(self._update_ui, all_states)
+                        )
 
                     # attempt to fast-sync anything that is easy to sync
                     if self.do_safe_sync_all:
@@ -372,7 +373,7 @@ class BSController:
         self.last_active_func = curr_func
         self.ctx_change_callback(states)
 
-    def start_worker_routines(self):
+    def start_worker_routines(self, start_ui=True):
         self._run_updater_threads = True
         # Thread instances can only be started once; recreate after a previous run
         # (e.g. when switching projects re-runs connect()).
@@ -382,7 +383,11 @@ class BSController:
 
         self.push_job_scheduler.start_worker_thread()
 
-        self._init_ui_components()
+        # The Qt UI-updater thread must not be spun up before IDA's Qt event loop
+        # is running (e.g. during auto-recover's database_inited connect). Defer it
+        # to the GUI-open path when start_ui is False.
+        if start_ui:
+            self._init_ui_components()
         # start the callbacks for edits to artifacts
         self.deci.start_artifact_watchers()
 
@@ -405,7 +410,7 @@ class BSController:
     # Client Interaction Functions
     #
 
-    def connect(self, user, path, init_repo=False, remote_url=None, single_thread=False, **kwargs):
+    def connect(self, user, path, init_repo=False, remote_url=None, single_thread=False, start_ui=True, **kwargs):
         # If we were previously connected, tear down the old worker routines first
         # so we don't end up with stale background threads pointing at the old client.
         if self.client is not None:
@@ -420,7 +425,7 @@ class BSController:
         )
 
         if not single_thread:
-            self.start_worker_routines()
+            self.start_worker_routines(start_ui=start_ui)
 
         return self.client.connection_warnings
 

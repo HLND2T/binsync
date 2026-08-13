@@ -126,7 +126,11 @@ def auto_recover(controller) -> bool:
     repo = cfg.repo_path
     if repo.exists():
         _l.info("Auto-recover: connecting to existing project %s as %s", repo, user)
-        controller.connect(user, str(repo), init_repo=False, remote_url=None)
+        # start_ui=False: the Qt UI-updater thread must not be created here —
+        # database_inited fires before IDA's Qt event loop is fully up, and
+        # creating a QThread there crashes Qt6Widgets. The control panel starts
+        # the UI thread lazily when it is opened.
+        controller.connect(user, str(repo), init_repo=False, remote_url=None, start_ui=False)
         return True
 
     # local repo missing
@@ -144,7 +148,7 @@ def auto_recover(controller) -> bool:
             return False
 
     _l.info("Auto-recover: cloning %s from %s", repo, cfg.remote)
-    controller.connect(user, str(repo), init_repo=False, remote_url=cfg.remote)
+    controller.connect(user, str(repo), init_repo=False, remote_url=cfg.remote, start_ui=False)
     return True
 
 

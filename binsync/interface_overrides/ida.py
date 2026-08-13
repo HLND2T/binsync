@@ -139,6 +139,11 @@ class BinsyncPlugin(GenericIDAPlugin):
         """
         Open the control panel view and attach it to IDA View-A or Pseudocode-A.
         """
+        # Auto-recover connects with start_ui=False (creating a QThread during
+        # database_inited crashes Qt6Widgets). Ensure the UI-updater thread is
+        # running now that we're on the Qt main thread. No-op if already running.
+        self.controller._init_ui_components()
+
         # If a panel already exists, reuse it. Building a new ControlPanel on
         # every project (re)selection orphans the old one's models and queued
         # signals; once Python eventually GCs them, pending QMetaCallEvents hit
