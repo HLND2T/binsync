@@ -11,6 +11,7 @@ from declib.artifacts import (
     FunctionHeader, StackVariable, Comment, Struct
 )
 from binsync.core.client import Client
+from binsync.auto_recover import _is_first_sync
 
 
 class TestClient(unittest.TestCase):
@@ -133,7 +134,53 @@ class TestClient(unittest.TestCase):
             # on the creation of the client, it will load the master_state, which will result in an
             # exception because the TOML fails to load
             self.assertRaises(toml.decoder.TomlDecodeError, lambda: Client("user0", tmpdir, "fake_hash"))
-            
+
+
+class TestAutoRecoverFirstSync(unittest.TestCase):
+    """
+    Regression tests for _is_first_sync (binsync/auto_recover.py).
+
+    The master user's branch is created from binsync/__root__, which already carries
+    the "Root commit" that initialized the repo. _is_first_sync must count only the
+    commits the user added on top of the root branch, otherwise the first-sync guard
+    always returns False and auto_sync_all never fires.
+    """
+
+    def _make_client(self, tmpdir):
+        return Client("user0", tmpdir, "fake_hash", init_repo=True)
+
+    def test_first_sync_only_root_commit(self):
+        """A brand-new user branch carries only the Root commit -> first sync."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            try:
+                self.assertTrue(_is_first_sync(client))
+            finally:
+                client.shutdown()
+
+    def test_first_sync_after_user_created_commit(self):
+        """After the updater's first 'User created' commit -> still first sync."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            try:
+                client.commit_and_update_states(commit_msg="User created")
+                self.assertTrue(_is_first_sync(client))
+            finally:
+                client.shutdown()
+
+    def test_not_first_sync_with_artifact_commit(self):
+        """Once the user has real artifact commits -> not first sync."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            try:
+                state = client.master_state
+                state.set_function_header(FunctionHeader("my_func", 0x400080))
+                client.master_state = state
+                client.commit_and_update_states(commit_msg="Updated my_func")
+                self.assertFalse(_is_first_sync(client))
+            finally:
+                client.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main(argv=sys.argv)
