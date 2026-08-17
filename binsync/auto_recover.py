@@ -15,7 +15,9 @@ Sidecar schema::
                                     //   default is <binary>.bsproj (same dir as the binary)
         "expected_md5": "...",      // optional; skip if it doesn't match the loaded binary's md5
         "force_user": false,        // optional; use "user" verbatim instead of the current OS user
-        "auto_clone": true          // optional; false prompts before cloning a missing repo
+        "auto_clone": true,         // optional; false prompts before cloning a missing repo
+        "auto_sync_all": false      // optional; pull in all teammates' data automatically
+                                    //   on the first-ever sync for this user + binary
     }
 
 The clone/connect decision never depends on ``user``: the repo is cloned whenever
@@ -31,9 +33,25 @@ import logging
 import os
 import pathlib
 
-import ida_kernwin
-import idaapi
-import idc
+import git
+
+# IDA-only modules are imported lazily inside the functions that use them so this
+# module stays importable in test/headless environments. AutoRecoverHook needs an
+# idaapi.UI_Hooks base class, so fall back to a plain object when IDA is absent.
+try:
+    import ida_kernwin
+except ImportError:
+    ida_kernwin = None
+
+try:
+    import idaapi
+except ImportError:
+    idaapi = None
+
+try:
+    import idc
+except ImportError:
+    idc = None
 
 _l = logging.getLogger(__name__)
 
@@ -52,6 +70,7 @@ class AutoRecoverConfig:
         "expected_md5",
         "force_user",
         "auto_clone",
+        "auto_sync_all",
     )
 
     def __init__(self, binary_path: pathlib.Path, data: dict):
@@ -62,6 +81,7 @@ class AutoRecoverConfig:
         self.expected_md5 = data.get("expected_md5")
         self.force_user = bool(data.get("force_user", False))
         self.auto_clone = bool(data.get("auto_clone", False))
+        self.auto_sync_all = bool(data.get("auto_sync_all", False))
 
         raw_repo = data.get("repo_path")
         if raw_repo:
@@ -86,12 +106,119 @@ def _resolve_user(cfg: AutoRecoverConfig) -> str:
     return os_user or cfg.user or "user"
 
 
+def _is_first_sync(client) -> bool:
+    """True if the master user has no real artifacts committed for this binary yet.
+
+    The master user's branch is ``binsync/<user>`` and is created from the shared
+    ``binsync/__root__`` branch (see Client._get_or_init_user_branch). That root branch
+    already carries the "Root commit" that initialized the repo, so iter_commits on the
+    user branch *includes* that ancestor — we must only count the commits the user added
+    *on top of* the root branch, i.e. ``binsync/__root__..binsync/<user>``.
+
+    As long as that set is empty (branch not created yet) or carries only the updater
+    thread's first ``commit_and_update_states("User created")`` (see
+    controller.updater_routine), the user has produced no artifacts for this binary and
+    this is their first-ever sync — the right moment to auto ``sync_all`` teammates'
+    data.
+
+    The check FAILS CLOSED: True is returned only from the ``root..user`` range being
+    empty or carrying just the initial "User created" commit. Any failure to resolve a
+    branch ref or read the history (corrupt repo, malformed ref, missing
+    ``binsync/__root__``, permissions, concurrent git) is logged and returns False, so
+    an unverifiable repo never triggers an automatic full sync.
+
+    This is a pure git-history check: no state file to keep in sync, works across
+    machines/sessions, and is naturally scoped per (user, binary).
+    """
+    from binsync.core.client import BINSYNC_ROOT_BRANCH
+
+    master_branch = f"binsync/{client.master_user}"
+
+    # In the production path this runs right after controller.connect(), where
+    # Client._get_or_init_user_branch() has already created (or fetched) the master
+    # user's branch, so "branch not created yet" is not a state this path needs to
+    # support. A repo.commit() that raises BadName therefore means the ref exists but
+    # is unreadable (malformed object id, corrupted repo) — not a brand-new user — so
+    # ALL resolution failures fail CLOSED (return False) and never fire an automatic
+    # full sync_all on an unverifiable repo.
+    try:
+        client.repo.commit(master_branch)
+        client.repo.commit(BINSYNC_ROOT_BRANCH)
+    except git.BadName as e:
+        _l.error("Auto-sync-all: could not resolve %s: %s; skipping.", e, str(e)[:80])
+        return False
+    except Exception:
+        _l.exception("Auto-sync-all: failed to resolve branch refs, skipping.")
+        return False
+
+    # Both branches resolve. The user branch was created from binsync/__root__ (which
+    # already carries the "Root commit"), so only count commits on top of root: an
+    # empty range means a brand-new user (first sync); only the updater's first
+    # "User created" commit also means first sync; anything else means the user has
+    # real artifacts and the auto sync is skipped.
+    try:
+        commits = list(client.repo.iter_commits(f"{BINSYNC_ROOT_BRANCH}..{master_branch}"))
+    except Exception:
+        _l.exception("Auto-sync-all: failed to read git history, skipping.")
+        return False
+    return len(commits) == 0 or (len(commits) == 1 and commits[0].message.strip() == "User created")
+
+
+def _maybe_schedule_auto_sync_all(controller) -> None:
+    """Schedule a first-time sync_all on the worker thread, if configured and applicable.
+
+    Runs inside the connect() path of auto_recover, synchronously right after
+    controller.connect() returns. The updater thread's first "User created" commit
+    may or may not have happened yet; either way _is_first_sync stays correct because
+    it only returns True while the master branch carries no more than that single
+    initial commit (or no branch at all).
+
+    sync_all(user=X) fills data *from* user X (see controller.sync_all), so a first-time
+    sync must pull from every non-master user, not the master user itself. Each sync_all
+    must NOT run inline here: database_inited fires before IDA's Qt event loop is up, and
+    the fill_* calls touch the GUI. schedule_job dispatches to the push scheduler's
+    worker thread instead.
+    """
+    if controller.headless:
+        return
+    if not controller.client:
+        return
+    if not _is_first_sync(controller.client):
+        _l.debug("Auto-sync-all: master user already has artifacts, skipping first-time sync.")
+        return
+
+    master_user = controller.client.master_user
+    try:
+        other_users = [u for u in controller.usernames() if u != master_user]
+    except Exception:
+        _l.exception("Auto-sync-all: failed to enumerate users, skipping.")
+        return
+
+    if not other_users:
+        _l.info("Auto-sync-all: no other users in the project yet, nothing to sync.")
+        return
+
+    _l.info("Auto-sync-all: first sync for %s, scheduling sync_all from %s...",
+            master_user, other_users)
+    # NOTE: schedule_job dispatches to the push scheduler's worker thread, which runs
+    # under the same client git locks as the updater thread's pull/push, so concurrent
+    # execution is safe (this is the same path the activity table's "Sync-All" uses).
+    # If a user branch was not yet fetched, get_state() checkout fails silently and that
+    # user's data is simply skipped for this first sync — the user can still Sync manually.
+    for user in other_users:
+        controller.schedule_job(controller.sync_all, user=user)
+
+
 def auto_recover(controller) -> bool:
     """Connect ``controller`` to the project described by the binary's sidecar.
 
     Returns True if a connection was attempted, False if there was nothing to do
     (no sidecar, md5 mismatch, or the user declined a clone).
     """
+    if idc is None:
+        _l.debug("Auto-recover: IDA modules unavailable (non-IDA environment), skipping.")
+        return False
+
     input_path = idc.get_input_file_path()
     if not input_path:
         _l.debug("Auto-recover: no input file path yet, skipping.")
@@ -123,14 +250,20 @@ def auto_recover(controller) -> bool:
                 )
                 return False
 
-    repo = cfg.repo_path
-    if repo.exists():
-        _l.info("Auto-recover: connecting to existing project %s as %s", repo, user)
+    def _connect_and_maybe_sync():
         # start_ui=False: the Qt UI-updater thread must not be created here —
         # database_inited fires before IDA's Qt event loop is fully up, and
         # creating a QThread there crashes Qt6Widgets. The control panel starts
         # the UI thread lazily when it is opened.
-        controller.connect(user, str(repo), init_repo=False, remote_url=None, start_ui=False)
+        controller.connect(user, str(repo), init_repo=False, remote_url=remote_url, start_ui=False)
+        if cfg.auto_sync_all:
+            _maybe_schedule_auto_sync_all(controller)
+
+    repo = cfg.repo_path
+    if repo.exists():
+        _l.info("Auto-recover: connecting to existing project %s as %s", repo, user)
+        remote_url = None
+        _connect_and_maybe_sync()
         return True
 
     # local repo missing
@@ -139,6 +272,9 @@ def auto_recover(controller) -> bool:
         return False
 
     if not cfg.auto_clone:
+        if ida_kernwin is None:
+            _l.warning("Auto-recover: %s does not exist and IDA dialog module unavailable; skipping.", repo)
+            return False
         answer = ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES | ida_kernwin.ASKBTN_NO,
             "HIDECANCEL\nBinSync project is missing. Clone it now?\n%s\nfrom\n%s" % (repo, cfg.remote),
@@ -148,11 +284,12 @@ def auto_recover(controller) -> bool:
             return False
 
     _l.info("Auto-recover: cloning %s from %s", repo, cfg.remote)
-    controller.connect(user, str(repo), init_repo=False, remote_url=cfg.remote, start_ui=False)
+    remote_url = cfg.remote
+    _connect_and_maybe_sync()
     return True
 
 
-class AutoRecoverHook(idaapi.UI_Hooks):
+class AutoRecoverHook(idaapi.UI_Hooks if idaapi is not None else object):
     """Fires auto_recover() whenever IDA finishes initializing a database.
 
     ``database_inited`` fires for *both* freshly-loaded input files and reopened
@@ -162,7 +299,8 @@ class AutoRecoverHook(idaapi.UI_Hooks):
     """
 
     def __init__(self, controller):
-        idaapi.UI_Hooks.__init__(self)
+        if idaapi is not None:
+            idaapi.UI_Hooks.__init__(self)
         self.controller = controller
         self._attempted = set()
 
@@ -171,6 +309,9 @@ class AutoRecoverHook(idaapi.UI_Hooks):
 
     def _on_file_loaded(self):
         if os.environ.get("BINSYNC_AUTO_RECOVER", "1") == "0":
+            return 0
+
+        if idc is None:
             return 0
 
         md5_buf = idc.retrieve_input_file_md5()

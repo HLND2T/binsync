@@ -276,7 +276,12 @@ class BinsyncTableView(QTableView):
         row_idx = self.selectionModel().selectedIndexes()[0]
         tls_row_idx = self.proxymodel.mapToSource(row_idx)
         row = self.model.row_data[tls_row_idx.row()]
-        self.controller.deci.gui_goto(row[self.model.addr_col])
+        addr = row[self.model.addr_col]
+        # The addr column (e.g. "Current" in the activity table) can be None or -1
+        # for users without a valid address; don't feed those to gui_goto.
+        if not isinstance(addr, int) or addr < 0:
+            return
+        self.controller.deci.gui_goto(addr)
 
     def _col_hide_handler(self, index):
         """ Helper function to hide/show columns from context menu """
