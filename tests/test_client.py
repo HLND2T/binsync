@@ -158,17 +158,20 @@ class TestAutoRecoverFirstSync(unittest.TestCase):
             finally:
                 client.shutdown()
 
-    def test_first_sync_user_branch_not_created(self):
-        """A master user whose branch was never created -> first sync."""
-        from binsync.core.client import BINSYNC_ROOT_BRANCH
+    def test_fail_closed_when_user_ref_malformed(self):
+        """A malformed user branch ref must NOT be treated as first sync (fail closed).
+
+        In production _is_first_sync runs after connect(), which has already created
+        the user branch, so an unresolvable ref means corruption, not a new user.
+        """
+        import pathlib
 
         with tempfile.TemporaryDirectory() as tmpdir:
             client = self._make_client(tmpdir)
             try:
-                # detach HEAD so the user branch is not bound to the worktree
-                client.repo.git.checkout("--detach", BINSYNC_ROOT_BRANCH)
-                client.repo.git.branch("-D", "binsync/user0")
-                self.assertTrue(_is_first_sync(client))
+                ref_path = pathlib.Path(tmpdir) / ".git" / "refs" / "heads" / "binsync" / "user0"
+                ref_path.write_text("abc123\n")  # invalid object id
+                self.assertFalse(_is_first_sync(client))
             finally:
                 client.shutdown()
 

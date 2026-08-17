@@ -121,10 +121,11 @@ def _is_first_sync(client) -> bool:
     this is their first-ever sync — the right moment to auto ``sync_all`` teammates'
     data.
 
-    The check FAILS CLOSED: True is returned only when the master user's branch is
-    positively confirmed not to exist yet. Any other git failure (corrupt repo, missing
-    ``binsync/__root__`` branch, permissions, concurrent git) is logged and returns
-    False, so an unverifiable repo never triggers an automatic full sync.
+    The check FAILS CLOSED: True is returned only from the ``root..user`` range being
+    empty or carrying just the initial "User created" commit. Any failure to resolve a
+    branch ref or read the history (corrupt repo, malformed ref, missing
+    ``binsync/__root__``, permissions, concurrent git) is logged and returns False, so
+    an unverifiable repo never triggers an automatic full sync.
 
     This is a pure git-history check: no state file to keep in sync, works across
     machines/sessions, and is naturally scoped per (user, binary).
@@ -132,31 +133,29 @@ def _is_first_sync(client) -> bool:
     from binsync.core.client import BINSYNC_ROOT_BRANCH
 
     master_branch = f"binsync/{client.master_user}"
-    # Only treat a branch as "first sync" when we can positively confirm the master
-    # user's branch does not exist yet. Any other git failure (corrupt repo, missing
-    # root branch, permissions, concurrent git) must fail CLOSED (return False) so we
-    # never fire an automatic full sync_all on an unverifiable repo.
+
+    # In the production path this runs right after controller.connect(), where
+    # Client._get_or_init_user_branch() has already created (or fetched) the master
+    # user's branch, so "branch not created yet" is not a state this path needs to
+    # support. A repo.commit() that raises BadName therefore means the ref exists but
+    # is unreadable (malformed object id, corrupted repo) — not a brand-new user — so
+    # ALL resolution failures fail CLOSED (return False) and never fire an automatic
+    # full sync_all on an unverifiable repo.
     try:
         client.repo.commit(master_branch)
-    except git.BadName:
-        # the master user's branch has not been created yet (brand-new user),
-        # which is the very first sync
-        return True
-    except Exception:
-        _l.exception("Auto-sync-all: failed to resolve master branch %s, skipping.", master_branch)
-        return False
-
-    # The user branch exists. It was created from binsync/__root__ (which already
-    # carries the "Root commit"), so only count commits on top of root.
-    try:
         client.repo.commit(BINSYNC_ROOT_BRANCH)
-    except git.BadName:
-        _l.error("Auto-sync-all: binsync/__root__ branch is missing, cannot determine first sync.")
+    except git.BadName as e:
+        _l.error("Auto-sync-all: could not resolve %s: %s; skipping.", e, str(e)[:80])
         return False
     except Exception:
-        _l.exception("Auto-sync-all: failed to resolve %s, skipping.", BINSYNC_ROOT_BRANCH)
+        _l.exception("Auto-sync-all: failed to resolve branch refs, skipping.")
         return False
 
+    # Both branches resolve. The user branch was created from binsync/__root__ (which
+    # already carries the "Root commit"), so only count commits on top of root: an
+    # empty range means a brand-new user (first sync); only the updater's first
+    # "User created" commit also means first sync; anything else means the user has
+    # real artifacts and the auto sync is skipped.
     try:
         commits = list(client.repo.iter_commits(f"{BINSYNC_ROOT_BRANCH}..{master_branch}"))
     except Exception:
