@@ -15,7 +15,9 @@ Sidecar schema::
                                     //   default is <binary>.bsproj (same dir as the binary)
         "expected_md5": "...",      // optional; skip if it doesn't match the loaded binary's md5
         "force_user": false,        // optional; use "user" verbatim instead of the current OS user
-        "auto_clone": true          // optional; false prompts before cloning a missing repo
+        "auto_clone": true,         // optional; false prompts before cloning a missing repo
+        "auto_sync_all": false      // optional; pull in all teammates' data automatically
+                                    //   on the first-ever sync for this user + binary
     }
 
 The clone/connect decision never depends on ``user``: the repo is cloned whenever
@@ -31,6 +33,7 @@ import logging
 import os
 import pathlib
 
+import git
 import ida_kernwin
 import idaapi
 import idc
@@ -52,6 +55,7 @@ class AutoRecoverConfig:
         "expected_md5",
         "force_user",
         "auto_clone",
+        "auto_sync_all",
     )
 
     def __init__(self, binary_path: pathlib.Path, data: dict):
@@ -62,6 +66,7 @@ class AutoRecoverConfig:
         self.expected_md5 = data.get("expected_md5")
         self.force_user = bool(data.get("force_user", False))
         self.auto_clone = bool(data.get("auto_clone", False))
+        self.auto_sync_all = bool(data.get("auto_sync_all", False))
 
         raw_repo = data.get("repo_path")
         if raw_repo:
@@ -84,6 +89,77 @@ def _resolve_user(cfg: AutoRecoverConfig) -> str:
         os_user = None
 
     return os_user or cfg.user or "user"
+
+
+def _is_first_sync(client) -> bool:
+    """True if the master user has no real artifacts committed for this binary yet.
+
+    The master user's branch is ``binsync/<user>``. On connect, the updater thread's
+    first ``commit_and_update_states("User created")`` (see controller.updater_routine)
+    creates an empty initial commit. As long as the branch only carries that commit
+    (or has none at all), the user has produced no artifacts for this binary and this
+    is their first-ever sync — the right moment to auto ``sync_all`` teammates' data.
+
+    This is a pure git-history check: no state file to keep in sync, works across
+    machines/sessions, and is naturally scoped per (user, binary).
+    """
+    master_branch = f"binsync/{client.master_user}"
+    try:
+        commits = list(client.repo.iter_commits(master_branch))
+    except git.GitCommandError as e:
+        if "bad revision" in str(e).lower():
+            # the master user's branch has not been created yet (brand-new user),
+            # which is the very first sync
+            return True
+        return False
+    except Exception:
+        return False
+    return len(commits) == 0 or (len(commits) == 1 and commits[0].message.strip() == "User created")
+
+
+def _maybe_schedule_auto_sync_all(controller) -> None:
+    """Schedule a first-time sync_all on the worker thread, if configured and applicable.
+
+    Runs inside the connect() path of auto_recover, synchronously right after
+    controller.connect() returns. The updater thread's first "User created" commit
+    may or may not have happened yet; either way _is_first_sync stays correct because
+    it only returns True while the master branch carries no more than that single
+    initial commit (or no branch at all).
+
+    sync_all(user=X) fills data *from* user X (see controller.sync_all), so a first-time
+    sync must pull from every non-master user, not the master user itself. Each sync_all
+    must NOT run inline here: database_inited fires before IDA's Qt event loop is up, and
+    the fill_* calls touch the GUI. schedule_job dispatches to the push scheduler's
+    worker thread instead.
+    """
+    if controller.headless:
+        return
+    if not controller.client:
+        return
+    if not _is_first_sync(controller.client):
+        _l.debug("Auto-sync-all: master user already has artifacts, skipping first-time sync.")
+        return
+
+    master_user = controller.client.master_user
+    try:
+        other_users = [u for u in controller.usernames() if u != master_user]
+    except Exception:
+        _l.exception("Auto-sync-all: failed to enumerate users, skipping.")
+        return
+
+    if not other_users:
+        _l.info("Auto-sync-all: no other users in the project yet, nothing to sync.")
+        return
+
+    _l.info("Auto-sync-all: first sync for %s, scheduling sync_all from %s...",
+            master_user, other_users)
+    # NOTE: schedule_job dispatches to the push scheduler's worker thread, which runs
+    # under the same client git locks as the updater thread's pull/push, so concurrent
+    # execution is safe (this is the same path the activity table's "Sync-All" uses).
+    # If a user branch was not yet fetched, get_state() checkout fails silently and that
+    # user's data is simply skipped for this first sync — the user can still Sync manually.
+    for user in other_users:
+        controller.schedule_job(controller.sync_all, user=user)
 
 
 def auto_recover(controller) -> bool:
@@ -123,14 +199,20 @@ def auto_recover(controller) -> bool:
                 )
                 return False
 
-    repo = cfg.repo_path
-    if repo.exists():
-        _l.info("Auto-recover: connecting to existing project %s as %s", repo, user)
+    def _connect_and_maybe_sync():
         # start_ui=False: the Qt UI-updater thread must not be created here —
         # database_inited fires before IDA's Qt event loop is fully up, and
         # creating a QThread there crashes Qt6Widgets. The control panel starts
         # the UI thread lazily when it is opened.
-        controller.connect(user, str(repo), init_repo=False, remote_url=None, start_ui=False)
+        controller.connect(user, str(repo), init_repo=False, remote_url=remote_url, start_ui=False)
+        if cfg.auto_sync_all:
+            _maybe_schedule_auto_sync_all(controller)
+
+    repo = cfg.repo_path
+    if repo.exists():
+        _l.info("Auto-recover: connecting to existing project %s as %s", repo, user)
+        remote_url = None
+        _connect_and_maybe_sync()
         return True
 
     # local repo missing
@@ -148,7 +230,8 @@ def auto_recover(controller) -> bool:
             return False
 
     _l.info("Auto-recover: cloning %s from %s", repo, cfg.remote)
-    controller.connect(user, str(repo), init_repo=False, remote_url=cfg.remote, start_ui=False)
+    remote_url = cfg.remote
+    _connect_and_maybe_sync()
     return True
 
 
