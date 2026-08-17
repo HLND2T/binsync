@@ -121,20 +121,46 @@ def _is_first_sync(client) -> bool:
     this is their first-ever sync — the right moment to auto ``sync_all`` teammates'
     data.
 
+    The check FAILS CLOSED: True is returned only when the master user's branch is
+    positively confirmed not to exist yet. Any other git failure (corrupt repo, missing
+    ``binsync/__root__`` branch, permissions, concurrent git) is logged and returns
+    False, so an unverifiable repo never triggers an automatic full sync.
+
     This is a pure git-history check: no state file to keep in sync, works across
     machines/sessions, and is naturally scoped per (user, binary).
     """
     from binsync.core.client import BINSYNC_ROOT_BRANCH
 
     master_branch = f"binsync/{client.master_user}"
+    # Only treat a branch as "first sync" when we can positively confirm the master
+    # user's branch does not exist yet. Any other git failure (corrupt repo, missing
+    # root branch, permissions, concurrent git) must fail CLOSED (return False) so we
+    # never fire an automatic full sync_all on an unverifiable repo.
     try:
-        # only commits reachable from the user branch but NOT from the root branch
-        commits = list(client.repo.iter_commits(f"{BINSYNC_ROOT_BRANCH}..{master_branch}"))
-    except git.GitCommandError:
-        # the user branch (or root branch) does not exist yet (brand-new repo/user) —
-        # there is nothing on top of root, so this is the very first sync
+        client.repo.commit(master_branch)
+    except git.BadName:
+        # the master user's branch has not been created yet (brand-new user),
+        # which is the very first sync
         return True
     except Exception:
+        _l.exception("Auto-sync-all: failed to resolve master branch %s, skipping.", master_branch)
+        return False
+
+    # The user branch exists. It was created from binsync/__root__ (which already
+    # carries the "Root commit"), so only count commits on top of root.
+    try:
+        client.repo.commit(BINSYNC_ROOT_BRANCH)
+    except git.BadName:
+        _l.error("Auto-sync-all: binsync/__root__ branch is missing, cannot determine first sync.")
+        return False
+    except Exception:
+        _l.exception("Auto-sync-all: failed to resolve %s, skipping.", BINSYNC_ROOT_BRANCH)
+        return False
+
+    try:
+        commits = list(client.repo.iter_commits(f"{BINSYNC_ROOT_BRANCH}..{master_branch}"))
+    except Exception:
+        _l.exception("Auto-sync-all: failed to read git history, skipping.")
         return False
     return len(commits) == 0 or (len(commits) == 1 and commits[0].message.strip() == "User created")
 

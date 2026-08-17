@@ -158,6 +158,20 @@ class TestAutoRecoverFirstSync(unittest.TestCase):
             finally:
                 client.shutdown()
 
+    def test_first_sync_user_branch_not_created(self):
+        """A master user whose branch was never created -> first sync."""
+        from binsync.core.client import BINSYNC_ROOT_BRANCH
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            try:
+                # detach HEAD so the user branch is not bound to the worktree
+                client.repo.git.checkout("--detach", BINSYNC_ROOT_BRANCH)
+                client.repo.git.branch("-D", "binsync/user0")
+                self.assertTrue(_is_first_sync(client))
+            finally:
+                client.shutdown()
+
     def test_first_sync_after_user_created_commit(self):
         """After the updater's first 'User created' commit -> still first sync."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -177,6 +191,20 @@ class TestAutoRecoverFirstSync(unittest.TestCase):
                 state.set_function_header(FunctionHeader("my_func", 0x400080))
                 client.master_state = state
                 client.commit_and_update_states(commit_msg="Updated my_func")
+                self.assertFalse(_is_first_sync(client))
+            finally:
+                client.shutdown()
+
+    def test_fail_closed_when_root_branch_missing(self):
+        """Missing binsync/__root__ must NOT be treated as first sync (fail closed)."""
+        from binsync.core.client import BINSYNC_ROOT_BRANCH
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            try:
+                # detach HEAD so neither branch is bound to the worktree, then drop root
+                client.repo.git.checkout("--detach", BINSYNC_ROOT_BRANCH)
+                client.repo.git.branch("-D", BINSYNC_ROOT_BRANCH)
                 self.assertFalse(_is_first_sync(client))
             finally:
                 client.shutdown()
